@@ -1,24 +1,85 @@
 use std::{
     cell::RefCell,
+    collections::HashSet,
+    fmt::Debug,
     rc::{Rc, Weak},
+    sync::{Mutex, OnceLock},
 };
 
+use crate::{id::Id, RefCount};
+
+static NODES: OnceLock<Mutex<HashSet<Id>>> = OnceLock::new();
+
+/// View currently allocated nodes.
+pub fn nodes() -> HashSet<Id> {
+    let nodes = NODES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap();
+    nodes.clone()
+}
+
 #[derive(Debug, Default)]
-pub struct Node<T> {
+pub struct Node<T: Debug> {
+    id: Id, // For debugging, tracking (de)allocations.
+
     pub data: T,
-    // TODO Demo what happens if we use Rc instead of Weak.
+
+    // XXX To demo what happens if we use Rc instead of Weak.
+    // prev: Option<Rc<RefCell<Node<T>>>>,
     prev: Option<Weak<RefCell<Node<T>>>>,
     next: Option<Rc<RefCell<Node<T>>>>,
 }
 
+impl<T: Debug> Node<T> {
+    fn new(data: T) -> Self {
+        let id = Id::next();
+        let mut nodes = NODES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap();
+        nodes.insert(id);
+        Self {
+            data,
+            id,
+            prev: None,
+            next: None,
+        }
+    }
+}
+
+// To demonstrate the leak.
+// When using Rc instead of Weak for prev - this never gets called:
+impl<T: Debug> Drop for Node<T> {
+    fn drop(&mut self) {
+        eprintln!("[debug] DROPPING list node={self:?}.");
+        let mut nodes = NODES
+            .get()
+            .unwrap_or_else(|| {
+                unreachable!(
+                    "De-allocating a list node which was never allocated.\
+                    node={self:?}"
+                )
+            })
+            .lock()
+            .unwrap();
+        eprintln!("[debug] DROPPING list node: {:?} of {:?}", self.id, nodes);
+        assert!(
+            nodes.remove(&self.id),
+            "Removing a node that we previously added."
+        );
+        eprintln!();
+    }
+}
+
 #[derive(Debug, Default)]
-pub struct List<T> {
+pub struct List<T: Debug> {
     head: Option<Rc<RefCell<Node<T>>>>,
     tail: Option<Rc<RefCell<Node<T>>>>,
 }
 
 // TODO Remove unnecessary clones.
-impl<T: Clone> List<T> {
+impl<T: Clone + Debug> List<T> {
     pub fn new() -> Self {
         Self {
             head: None,
@@ -53,6 +114,14 @@ impl<T: Clone> List<T> {
                         yet it is not the head!"
                     );
                 }
+
+                // XXX When prev = Rc:
+                // Some(old_prev) => {
+                //     old_prev.borrow_mut().next = None;
+                //     self.tail = Some(old_prev); // Old previous is new tail.
+                // }
+
+                // XXX When prev = Weak:
                 Some(old_prev_weak) => {
                     if let Some(old_prev) = old_prev_weak.upgrade() {
                         old_prev.borrow_mut().next = None;
@@ -79,17 +148,13 @@ impl<T: Clone> List<T> {
     }
 
     pub fn push_front(&mut self, data: T) -> Rc<RefCell<Node<T>>> {
-        // Allocate.
-        let new = Rc::new(RefCell::new(Node {
-            data,
-            prev: None, // This will be head node, no predecessor.
-            // new<-old:
-            next: self.head.clone(), // Ergo previous head is its successor.
-        }));
+        // 1. Allocate.
+        let new = Rc::new(RefCell::new(Node::new(data)));
 
-        // Relink.
+        // 2. Relink.
         // new->old
         // new<-old
+        new.borrow_mut().next = self.head.clone();
         match self.head.take() {
             // Empty, so new node will also be tail, in addition to head.
             None => {
@@ -99,13 +164,18 @@ impl<T: Clone> List<T> {
             // Note that we already linked forward new->old in above allocation.
             Some(old) => {
                 // new<-old
+
+                // XXX When prev = Weak:
                 old.borrow_mut().prev = Some(Rc::downgrade(&new));
+
+                // XXX When prev = Rc:
+                // old.borrow_mut().prev = Some(new.clone());
             }
         }
         // New node is the new head.
         self.head = Some(new.clone());
 
-        // Return (for use in move_to_front).
+        // 3. Return (for use in move_to_front).
         new
     }
 
@@ -135,7 +205,12 @@ impl<T: Clone> List<T> {
         }
 
         let a_node_opt =
+            // XXX When prev = Rc:
+            // b_node.borrow().prev.clone().map(|a| a);
+
+            // XXX When prev = Weak:
             b_node.borrow().prev.clone().map(|a| a.upgrade()).flatten();
+
         let c_node_opt = b_node.borrow().next.clone();
 
         // A->C
@@ -145,6 +220,10 @@ impl<T: Clone> List<T> {
         // A<-C
         if let Some(c_node) = &c_node_opt {
             c_node.borrow_mut().prev =
+                // XXX When prev = Rc:
+                // a_node_opt.clone();
+
+                // XXX When prev = Weak:
                 a_node_opt.clone().map(|a| Rc::downgrade(&a));
         }
 
@@ -163,7 +242,12 @@ impl<T: Clone> List<T> {
             match self.head.take() {
                 // Non-empty, so: B<-H0, B->H0.
                 Some(old_head) => {
+                    // XXX When prev = Weak:
                     old_head.borrow_mut().prev = Some(Rc::downgrade(b_node));
+
+                    // XXX When prev = Rc:
+                    // old_head.borrow_mut().prev = Some(b_node.clone());
+
                     b_node_mut.next = Some(old_head);
                 }
                 // Empty, so: B->-
@@ -182,6 +266,23 @@ impl<T: Clone> List<T> {
         while let Some(node) = head {
             let x = node.borrow().data.clone();
             xs.push(x);
+            head = node.borrow().next.clone();
+        }
+        xs
+    }
+
+    pub fn to_ref_counts(&self) -> Vec<(Id, T, RefCount)> {
+        let mut xs = Vec::new();
+        let mut head = self.head.clone();
+        while let Some(node) = head {
+            let mut ref_count = RefCount::of(&node);
+            // XXX -1 because we just made a temp clone which
+            //     will be dropped when this method returns.
+            ref_count.strong -= 1;
+
+            let id = node.borrow().id;
+            let x = node.borrow().data.clone();
+            xs.push((id, x, ref_count));
             head = node.borrow().next.clone();
         }
         xs

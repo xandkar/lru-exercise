@@ -1,8 +1,10 @@
-use std::{cell::RefCell, collections::HashMap, hash::Hash, rc::Rc};
+use std::{
+    cell::RefCell, collections::HashMap, fmt::Debug, hash::Hash, rc::Rc,
+};
 
 use crate::list::{List, Node};
 
-pub struct LRU<Key, Val> {
+pub struct LRU<Key: Debug, Val: Debug> {
     cap: usize,
     siz: usize,
     index: HashMap<Key, Rc<RefCell<Node<(Key, Val)>>>>,
@@ -11,8 +13,8 @@ pub struct LRU<Key, Val> {
 
 impl<K, V> LRU<K, V>
 where
-    K: Hash + Eq + Clone,
-    V: Clone,
+    K: Hash + Eq + Clone + Debug,
+    V: Clone + Debug,
 {
     pub fn new(cap: usize) -> Self {
         Self {
